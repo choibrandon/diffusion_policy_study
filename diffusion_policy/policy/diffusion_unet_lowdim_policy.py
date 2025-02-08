@@ -10,15 +10,20 @@ from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 
+# 1 Diffusion(conditionalUnet1D) 모델을 이용한 행동 예측을 수행하는 클래스
+# 2 노이즈 스케줄러 (DDPMScheduler)를 이용해 diffusion 모델을 통해 샘플을 생성
+# 3 inference(예측): predict_action 함수를 통해 관측값을 바탕으로 행동을 예측
+# 4 training(학습): compute_loss 함수를 통해 손실을 계산
+
 class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
     def __init__(self, 
-            model: ConditionalUnet1D,
-            noise_scheduler: DDPMScheduler,
-            horizon, 
-            obs_dim, 
-            action_dim, 
-            n_action_steps, 
-            n_obs_steps,
+            model: ConditionalUnet1D, #추후확인
+            noise_scheduler: DDPMScheduler, #forward+reverse Diffusion 관리
+            horizon, #예측할 총 시퀀스 길이
+            obs_dim, #입력 관측값 차원
+            action_dim, #출력 행동 차원
+            n_action_steps, #행동 타임스텝 개수
+            n_obs_steps, #관측 타임스텝 개수
             num_inference_steps=None,
             obs_as_local_cond=False,
             obs_as_global_cond=False,
@@ -32,14 +37,14 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             assert obs_as_global_cond
         self.model = model
         self.noise_scheduler = noise_scheduler
-        self.mask_generator = LowdimMaskGenerator(
+        self.mask_generator = LowdimMaskGenerator( #추후확인
             action_dim=action_dim,
             obs_dim=0 if (obs_as_local_cond or obs_as_global_cond) else obs_dim,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
             action_visible=False
         )
-        self.normalizer = LinearNormalizer()
+        self.normalizer = LinearNormalizer() #추후확인
         self.horizon = horizon
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -55,26 +60,28 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
     
-    # ========= inference  ============
+    # ========= inference  ============ 이과정은 Diffusion 모델의 역과정을 통해 샘플을 생성하는 함수, 조건을 반영하여 생성하도록 설계
     def conditional_sample(self, 
-            condition_data, condition_mask,
+            condition_data, condition_mask, #data는 관측값, mask는 관측값이 있는 위치
             local_cond=None, global_cond=None,
             generator=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
-        model = self.model
-        scheduler = self.noise_scheduler
-
+        model = self.model #모델(ConditionalUnet1D)
+        scheduler = self.noise_scheduler #DDPMScheduler
+        
+        # initialize trajectory 생성할 샘플 초기화
         trajectory = torch.randn(
             size=condition_data.shape, 
             dtype=condition_data.dtype,
             device=condition_data.device,
             generator=generator)
     
-        # set step values
+        # set step values, self.num_inference_steps에 설정된 스텝 수 만큼의 역 diffusion 과정을 수행하도록 타임스텝을 초기화
         scheduler.set_timesteps(self.num_inference_steps)
 
+        #역 diffusion 과정
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -95,20 +102,22 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
         return trajectory
 
-
+    # 주어진 관측 데이터를 바탕으로 Diffusion 모델을 이용해 행동(행동 및 관측값)을 예측하는 함수, 입력값은 관측값을 포함한 딕셔너리이고, 출력은 예측행동을 포함하는 딕셔너리
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
         """
 
-        assert 'obs' in obs_dict
+        # 입력 검증 및 초기 정규화
+        assert 'obs' in obs_dict # "obs" 키가 없으면 에러 발생
         assert 'past_action' not in obs_dict # not implemented yet
-        nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
+        nobs = self.normalizer['obs'].normalize(obs_dict['obs']) # 관측값 정규화
+        # 결과 nobs는 (B, L, Do)형테의 텐서이며, B는 배치 크기, L은 시퀀스 길이, Do는 관측값 차원
         B, _, Do = nobs.shape
-        To = self.n_obs_steps
-        assert Do == self.obs_dim
-        T = self.horizon
+        To = self.n_obs_steps # 관측 타임스텝 개수
+        assert Do == self.obs_dim # 관측값 차원이 일치하는지 확인
+        T = self.horizon # horizon이 이게 예측할 전체 시퀀스의 길이이다.
         Da = self.action_dim
 
         # build input
@@ -118,6 +127,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
+        
+        #여기 부분은 조금 더 공부를 해야겠음 3가지 방식으로 관측값을 전달하는 방식
+        #local conditioning 방식, 관측 데이터를 로컬 특징으로 전달
         if self.obs_as_local_cond:
             # condition through local feature
             # all zero except first To timesteps

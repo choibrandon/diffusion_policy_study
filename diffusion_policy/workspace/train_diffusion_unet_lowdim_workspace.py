@@ -3,9 +3,13 @@ if __name__ == "__main__":
     import os
     import pathlib
 
-    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
-    sys.path.append(ROOT_DIR)
-    os.chdir(ROOT_DIR)
+    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent) #상위 3단계 폴더를 ROOT_DIR로 지정
+    sys.path.append(ROOT_DIR) # 방금 전 위의 경로를 python path로 지정
+    os.chdir(ROOT_DIR) # 현재 작업 디렉토리를 workspace를 ROOT_DIR로 변경 즉, 코드 실행시 경로 문제가 발생하지 않도록 보장 
+# 스크립트의 실행 진입점을 맨앞으로 놓은 이유는 모듈을 임포트 할 때, 보통 sys.path.append(ROOT_DIR)같은 거를 해야 모듈을 잘 찾을 수 있음 그래서 미리 
+# 하는 거임. 그래야 import diffusion_policy 와 같이 아래 것들을 잘 찾을 수 있음. 
+# 새로운 사실, os.chdir(ROOT_DIR)이 먼저 실행하면 어떤 경로에서든지 항상 프로젝트 루트에서 실행 되도록 보장.
+
 
 import os
 import hydra
@@ -33,36 +37,38 @@ from diffusers.training_utils import EMAModel
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 # %%
-class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace): #클래스 선언 하고 상위 클래스 BaseWorkspace 클래스 기능을 상속
+    include_keys = ['global_step', 'epoch'] #이 클래스에서 저장하거나 로깅할 중요한 변수를 지정하는 리스트임
+    #baseworkspace에서 데이터를 저장할 때, 이 키들을 저장하거나 불러오는 데 사용, 이건 체크포인트 저장할 때, 이변수들을 반드시 저장하도록 지정하는 역할
 
-    def __init__(self, cfg: OmegaConf, output_dir=None):
+    def __init__(self, cfg: OmegaConf, output_dir=None): #hydra 
         super().__init__(cfg, output_dir=output_dir)
 
-        # set seed
-        seed = cfg.training.seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        # set seed 랜덤 시드를 고정하면, 같은 입력에 대해 동일한 결과가 나옴(재현 가능성 확보)
+        seed = cfg.training.seed 
+        torch.manual_seed(seed) #pytorch 연산의 랜덤 시드 고정
+        np.random.seed(seed) # numpy의 랜덤 시드 고정
+        random.seed(seed) # python 기본 random 모듈 시드
 
         # configure model
-        self.model: DiffusionUnetLowdimPolicy
-        self.model = hydra.utils.instantiate(cfg.policy)
+        self.model: DiffusionUnetLowdimPolicy #self.model이 DiffusionUnetPolicy 타입의 객체임을 명시 아직은 인스턴스 화 하지않음
+        self.model = hydra.utils.instantiate(cfg.policy) #모델 인스턴스화 하이드라에서 
 
-        self.ema_model: DiffusionUnetLowdimPolicy = None
-        if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
+        self.ema_model: DiffusionUnetLowdimPolicy = None #ema(지수이동평균)모델은 훈련 중 모델의 가중치를 부드럽게 보정하여 더 안정적인 모델을 만드는 기법이다.
+        if cfg.training.use_ema: #cfg.training.use_ema=True 이면 사용함
+            self.ema_model = copy.deepcopy(self.model) #실제학습에는 사용하지 않고 더 나은 예측을 위해 따로 관리됨.
+        #ema 모델을 사용하면 가중치를 천천히 업데이트 하여 과적합 방지 효과가 있다. 
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
             cfg.optimizer, params=self.model.parameters())
-
+        # 훈련상태 변수 초기화
         self.global_step = 0
         self.epoch = 0
 
     def run(self):
-        cfg = copy.deepcopy(self.cfg)
-
+        cfg = copy.deepcopy(self.cfg) #여기서도 cfg 를 딥 카피함 기존 설정을 변경없이 유지하기 유하여
+        #cfg를 변경해도 self.cfg를 변하지 않도록
         # resume training
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
@@ -70,22 +76,22 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
 
-        # configure dataset
-        dataset: BaseLowdimDataset
-        dataset = hydra.utils.instantiate(cfg.task.dataset)
-        assert isinstance(dataset, BaseLowdimDataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        # configure dataset 데이터셋 가져오고
+        dataset: BaseLowdimDataset #추후확인
+        dataset = hydra.utils.instantiate(cfg.task.dataset) #아마도 task.dataset에 있는 클래스를 인스턴스화 하는 듯 task는 pusht_lowdim 같음
+        assert isinstance(dataset, BaseLowdimDataset) #인스턴스화 되었는지 확인 dataset이게 BaseLowdimDataset의 인스턴스인지 확인
+        train_dataloader = DataLoader(dataset, **cfg.dataloader) #데이터 로더를 만들어줌 그리고 **cfg.dataloader는 cfg파일에 있는 dataloader의 설정을 가져옴
         normalizer = dataset.get_normalizer()
 
-        # configure validation dataset
+        # configure validation dataset 벨리데이션
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
-        self.model.set_normalizer(normalizer)
+        self.model.set_normalizer(normalizer) #ema모델에도 normalizer를 설정 normalizer는 데이터셋의 평균과 표준편차를 저장하는 객체임
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
 
-        # configure lr scheduler
+        # configure lr scheduler 학습률 스케쥴러
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -95,7 +101,8 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                     // cfg.training.gradient_accumulate_every,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=self.global_step-1 
+            #초기값 설정, pytorch의 많은 lr 스케줄러는 기본적으로 last_epoch=-1로 설정, 훈련을 처음 시작하는 경우 self.global_step은 0일텐데, 0-1 = -1이 되어 초기값과 맞아 떨어진다.
         )
 
         # configure ema
@@ -106,7 +113,7 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 model=self.ema_model)
 
         # configure env runner
-        env_runner: BaseLowdimRunner
+        env_runner: BaseLowdimRunner #추후확인
         env_runner = hydra.utils.instantiate(
             cfg.task.env_runner,
             output_dir=self.output_dir)
@@ -125,7 +132,7 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
         )
 
         # configure checkpoint
-        topk_manager = TopKCheckpointManager(
+        topk_manager = TopKCheckpointManager( #추후확인
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
             **cfg.checkpoint.topk
         )
